@@ -1,12 +1,14 @@
 """
 NovaRetail Customer Intelligence Dashboard
 --------------------------------------------
-An executive-facing Streamlit dashboard built for NovaRetail's Director of
-Customer Intelligence. Provides KPI monitoring, segment/region/category
-performance views, and auto-generated business insights to support
-data-driven decision-making.
+Executive dashboard built for NovaRetail's Director of Customer Intelligence.
+Reads NR_dataset_edited.xlsx, cleans/standardizes it, and renders KPI cards,
+interactive Plotly charts, a Top 5 customers table, and an auto-generated
+Business Insights section — all filterable from the sidebar.
 
-Run locally with:  streamlit run app.py
+Run locally:    streamlit run app.py
+Deploy:         push app.py, requirements.txt, NR_dataset_edited.xlsx to GitHub
+                and point Streamlit Community Cloud at app.py.
 """
 
 import pandas as pd
@@ -14,141 +16,192 @@ import plotly.express as px
 import streamlit as st
 
 # ----------------------------------------------------------------------------
-# PAGE CONFIGURATION
+# Page configuration — must be the first Streamlit call
 # ----------------------------------------------------------------------------
 st.set_page_config(
-    page_title="NovaRetail | Customer Intelligence Dashboard",
+    page_title="NovaRetail | Customer Intelligence",
     page_icon="🛍️",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-# ----------------------------------------------------------------------------
-# LIGHT EXECUTIVE STYLING
-# ----------------------------------------------------------------------------
-st.markdown(
-    """
-    <style>
-        /* Overall page padding */
-        .block-container {padding-top: 1.5rem; padding-bottom: 2rem;}
-
-        /* KPI metric cards */
-        div[data-testid="stMetric"] {
-            background-color: #FFFFFF;
-            border: 1px solid #E6E6E6;
-            border-radius: 10px;
-            padding: 1rem 1rem 0.5rem 1rem;
-            box-shadow: 0 1px 3px rgba(0,0,0,0.06);
-        }
-        div[data-testid="stMetricLabel"] {font-weight: 600; color: #4B5563;}
-
-        /* Section headers */
-        h2, h3 {color: #1F2937;}
-
-        /* Insight cards */
-        .insight-card {
-            background-color: #F8FAFC;
-            border-left: 4px solid #2563EB;
-            border-radius: 6px;
-            padding: 0.9rem 1.1rem;
-            margin-bottom: 0.7rem;
-        }
-        .insight-card.warning {border-left-color: #DC2626; background-color: #FEF2F2;}
-        .insight-card.positive {border-left-color: #16A34A; background-color: #F0FDF4;}
-        .insight-card.action {border-left-color: #D97706; background-color: #FFFBEB;}
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
+DATA_PATH = "NR_dataset_edited.xlsx"
 
 # ----------------------------------------------------------------------------
-# DATA LOADING & CLEANING
+# Category standardization mapping
+# ----------------------------------------------------------------------------
+# Only HIGH and MEDIUM confidence groups (identified via manual review of the
+# ProductCategory column) are merged automatically. LOW confidence groups are
+# intentionally left untouched so the Director can review them separately.
+#
+#   HIGH confidence:
+#     Groceries / Grocery / Grocery Items          -> Groceries
+#     Toys / Toys & Games                          -> Toys & Games
+#     Sporting Goods / Sports & Outdoors /
+#       Sports Equipment                           -> Sports & Outdoors
+#     Furniture / Furniture & Decor                -> Furniture & Decor
+#
+#   MEDIUM confidence:
+#     Fashion / Fashion & Apparel / Clothing        -> Fashion & Apparel
+#     Beauty Products / Beauty & Personal Care /
+#       Cosmetics                                   -> Beauty & Personal Care
+#     Health & Wellness / Health Supplements        -> Health & Wellness
+#     Books / Books & Magazines                     -> Books & Magazines
+#
+#   LOW confidence (NOT merged): Home Decor, Home & Garden, Home Improvement,
+#     Fashion Accessories, Children's Clothing, Sportswear, Health & Beauty,
+#     Food & Beverages, Gardening Tools, Outdoor Equipment.
+CATEGORY_MAPPING = {
+    # High confidence
+    "Groceries": "Groceries",
+    "Grocery": "Groceries",
+    "Grocery Items": "Groceries",
+    "Toys": "Toys & Games",
+    "Toys & Games": "Toys & Games",
+    "Sporting Goods": "Sports & Outdoors",
+    "Sports & Outdoors": "Sports & Outdoors",
+    "Sports Equipment": "Sports & Outdoors",
+    "Furniture": "Furniture & Decor",
+    "Furniture & Decor": "Furniture & Decor",
+    # Medium confidence
+    "Fashion": "Fashion & Apparel",
+    "Fashion & Apparel": "Fashion & Apparel",
+    "Clothing": "Fashion & Apparel",
+    "Beauty Products": "Beauty & Personal Care",
+    "Beauty & Personal Care": "Beauty & Personal Care",
+    "Cosmetics": "Beauty & Personal Care",
+    "Health & Wellness": "Health & Wellness",
+    "Health Supplements": "Health & Wellness",
+    "Books": "Books & Magazines",
+    "Books & Magazines": "Books & Magazines",
+}
+
+
+# ----------------------------------------------------------------------------
+# Data loading & cleaning (cached so filters don't re-read the file each time)
 # ----------------------------------------------------------------------------
 @st.cache_data
-def load_data(path: str = "NR_dataset_edited.xlsx") -> pd.DataFrame:
-    """Load the NovaRetail dataset and apply light, targeted cleaning."""
+def load_and_clean_data(path: str):
+    """Read the raw Excel file, clean it, and standardize ProductCategory.
+
+    Returns:
+        df            -- cleaned dataframe ready for the dashboard
+        cats_before    -- sorted unique ProductCategory values before mapping
+        cats_after     -- sorted unique ProductCategory values after mapping
+        n_changed      -- number of records whose category value changed
+    """
     df = pd.read_excel(path)
 
-    # Standardize column names / rename the segment label column for clarity
-    df = df.rename(columns={"label": "CustomerSegment"})
+    # --- Handle missing values -------------------------------------------------
+    # 'label' (customer segment) is the only column with missing values in
+    # this dataset. Rather than dropping the row (and losing its revenue/
+    # satisfaction data), we tag it explicitly so it's visible in filters.
+    df["label"] = df["label"].fillna("Unclassified")
 
-    # Convert transaction date to proper datetime
-    df["TransactionDate"] = pd.to_datetime(df["TransactionDate"], errors="coerce")
+    # Defensive cleaning in case other columns ever contain blanks/nulls.
+    text_cols = [
+        "ProductCategory",
+        "CustomerAgeGroup",
+        "CustomerGender",
+        "CustomerRegion",
+        "RetailChannel",
+    ]
+    for col in text_cols:
+        df[col] = df[col].fillna("Unknown").astype(str).str.strip()
 
-    # Drop rows with no transaction date at all (unusable for time-based analysis)
-    df = df.dropna(subset=["TransactionDate"])
-
-    # Fill missing categorical values with an explicit "Unknown" bucket so
-    # records aren't silently dropped from the dashboard
-    for col in ["CustomerSegment", "ProductCategory", "CustomerAgeGroup",
-                "CustomerGender", "CustomerRegion", "RetailChannel"]:
-        if col in df.columns:
-            df[col] = df[col].fillna("Unknown")
-
-    # Purchase amount and satisfaction should be numeric; drop rows that
-    # cannot be used for revenue / satisfaction calculations
     df["PurchaseAmount"] = pd.to_numeric(df["PurchaseAmount"], errors="coerce")
-    df["CustomerSatisfaction"] = pd.to_numeric(df["CustomerSatisfaction"], errors="coerce")
+    df["CustomerSatisfaction"] = pd.to_numeric(
+        df["CustomerSatisfaction"], errors="coerce"
+    )
     df = df.dropna(subset=["PurchaseAmount", "CustomerSatisfaction"])
 
-    return df
+    # --- Convert TransactionDate to datetime -----------------------------------
+    df["TransactionDate"] = pd.to_datetime(df["TransactionDate"], errors="coerce")
+    df = df.dropna(subset=["TransactionDate"])
+
+    # --- Standardize ProductCategory using the approved mapping -----------------
+    cats_before = sorted(df["ProductCategory"].unique().tolist())
+
+    # Only replace values that are actually in the approved mapping; anything
+    # not in CATEGORY_MAPPING (including all "Low confidence" categories) is
+    # left exactly as-is.
+    original = df["ProductCategory"].copy()
+    df["ProductCategory"] = df["ProductCategory"].apply(
+        lambda x: CATEGORY_MAPPING.get(x, x)
+    )
+    n_changed = int((original != df["ProductCategory"]).sum())
+
+    cats_after = sorted(df["ProductCategory"].unique().tolist())
+
+    return df, cats_before, cats_after, n_changed
 
 
-df = load_data()
+df, cats_before, cats_after, n_changed = load_and_clean_data(DATA_PATH)
 
 # ----------------------------------------------------------------------------
-# SIDEBAR FILTERS
+# Sidebar — filters
 # ----------------------------------------------------------------------------
-st.sidebar.title("🔎 Filters")
-st.sidebar.caption("Refine the dashboard to a specific slice of customers.")
+st.sidebar.header("🔎 Filters")
 
-segments = sorted(df["CustomerSegment"].unique())
-regions = sorted(df["CustomerRegion"].unique())
-categories = sorted(df["ProductCategory"].unique())
-channels = sorted(df["RetailChannel"].unique())
-age_groups = sorted(df["CustomerAgeGroup"].unique())
-genders = sorted(df["CustomerGender"].unique())
+segments = sorted(df["label"].unique().tolist())
+regions = sorted(df["CustomerRegion"].unique().tolist())
+categories = sorted(df["ProductCategory"].unique().tolist())
+channels = sorted(df["RetailChannel"].unique().tolist())
+age_groups = sorted(df["CustomerAgeGroup"].unique().tolist())
+genders = sorted(df["CustomerGender"].unique().tolist())
 
-sel_segments = st.sidebar.multiselect("Customer Segment", segments, default=segments)
-sel_regions = st.sidebar.multiselect("Customer Region", regions, default=regions)
-sel_categories = st.sidebar.multiselect("Product Category", categories, default=categories)
-sel_channels = st.sidebar.multiselect("Retail Channel", channels, default=channels)
-sel_age_groups = st.sidebar.multiselect("Customer Age Group", age_groups, default=age_groups)
-sel_genders = st.sidebar.multiselect("Customer Gender", genders, default=genders)
-
-min_date, max_date = df["TransactionDate"].min(), df["TransactionDate"].max()
-date_range = st.sidebar.date_input(
-    "Transaction Date",
-    value=(min_date.date(), max_date.date()),
-    min_value=min_date.date(),
-    max_value=max_date.date(),
+selected_segments = st.sidebar.multiselect(
+    "Customer Segment", segments, default=segments
 )
-# Handle the case where the user has only picked a single date so far
-if isinstance(date_range, tuple) and len(date_range) == 2:
-    start_date, end_date = date_range
-else:
-    start_date, end_date = min_date.date(), max_date.date()
+selected_regions = st.sidebar.multiselect("Customer Region", regions, default=regions)
+selected_categories = st.sidebar.multiselect(
+    "Product Category", categories, default=categories
+)
+selected_channels = st.sidebar.multiselect(
+    "Retail Channel", channels, default=channels
+)
+selected_age_groups = st.sidebar.multiselect(
+    "Customer Age Group", age_groups, default=age_groups
+)
+selected_genders = st.sidebar.multiselect(
+    "Customer Gender", genders, default=genders
+)
 
-# ----------------------------------------------------------------------------
-# APPLY FILTERS
-# ----------------------------------------------------------------------------
+min_date = df["TransactionDate"].min().date()
+max_date = df["TransactionDate"].max().date()
+selected_date_range = st.sidebar.date_input(
+    "Transaction Date",
+    value=(min_date, max_date),
+    min_value=min_date,
+    max_value=max_date,
+)
+# date_input can return a single date while the user is mid-selection; guard it
+if isinstance(selected_date_range, tuple) and len(selected_date_range) == 2:
+    start_date, end_date = selected_date_range
+else:
+    start_date, end_date = min_date, max_date
+
+st.sidebar.markdown("---")
+st.sidebar.caption(
+    f"Showing data from **{min_date}** to **{max_date}** · "
+    f"{len(df):,} total transactions in the cleaned dataset."
+)
+
+# --- Apply filters -----------------------------------------------------------
 mask = (
-    df["CustomerSegment"].isin(sel_segments)
-    & df["CustomerRegion"].isin(sel_regions)
-    & df["ProductCategory"].isin(sel_categories)
-    & df["RetailChannel"].isin(sel_channels)
-    & df["CustomerAgeGroup"].isin(sel_age_groups)
-    & df["CustomerGender"].isin(sel_genders)
+    df["label"].isin(selected_segments)
+    & df["CustomerRegion"].isin(selected_regions)
+    & df["ProductCategory"].isin(selected_categories)
+    & df["RetailChannel"].isin(selected_channels)
+    & df["CustomerAgeGroup"].isin(selected_age_groups)
+    & df["CustomerGender"].isin(selected_genders)
     & (df["TransactionDate"].dt.date >= start_date)
     & (df["TransactionDate"].dt.date <= end_date)
 )
 fdf = df.loc[mask].copy()
 
-st.sidebar.markdown("---")
-st.sidebar.caption(f"Showing **{len(fdf):,}** of **{len(df):,}** transactions")
-
 # ----------------------------------------------------------------------------
-# HEADER
+# Header
 # ----------------------------------------------------------------------------
 st.title("🛍️ NovaRetail Customer Intelligence Dashboard")
 st.caption(
@@ -157,11 +210,29 @@ st.caption(
 )
 
 if fdf.empty:
-    st.warning("No transactions match the selected filters. Please broaden your filter selection.")
+    st.warning("No transactions match the current filters. Adjust the sidebar filters to see results.")
     st.stop()
 
 # ----------------------------------------------------------------------------
-# KPI CARDS
+# Data quality note — category standardization audit trail
+# ----------------------------------------------------------------------------
+with st.expander("🧹 Data Quality: Product Category Standardization", expanded=False):
+    st.write(
+        "Categories that clearly represented the same business category "
+        "(High/Medium confidence naming variants) were standardized. "
+        "Low-confidence potential matches were left unchanged for manual review."
+    )
+    col_a, col_b = st.columns(2)
+    with col_a:
+        st.markdown("**Before standardization**")
+        st.write(cats_before)
+    with col_b:
+        st.markdown("**After standardization**")
+        st.write(cats_after)
+    st.info(f"**{n_changed}** records were re-labeled to a standardized category name.")
+
+# ----------------------------------------------------------------------------
+# KPI cards
 # ----------------------------------------------------------------------------
 total_revenue = fdf["PurchaseAmount"].sum()
 num_customers = fdf["CustomerID"].nunique()
@@ -169,7 +240,7 @@ avg_purchase = fdf["PurchaseAmount"].mean()
 avg_satisfaction = fdf["CustomerSatisfaction"].mean()
 
 kpi1, kpi2, kpi3, kpi4 = st.columns(4)
-kpi1.metric("Total Revenue", f"${total_revenue:,.0f}")
+kpi1.metric("Total Revenue", f"${total_revenue:,.2f}")
 kpi2.metric("Number of Customers", f"{num_customers:,}")
 kpi3.metric("Average Purchase Amount", f"${avg_purchase:,.2f}")
 kpi4.metric("Average Customer Satisfaction", f"{avg_satisfaction:.2f} / 5")
@@ -177,148 +248,157 @@ kpi4.metric("Average Customer Satisfaction", f"{avg_satisfaction:.2f} / 5")
 st.markdown("---")
 
 # ----------------------------------------------------------------------------
-# REVENUE TREND
+# Row 1: Revenue trend + Revenue by segment
 # ----------------------------------------------------------------------------
-st.subheader("📈 Revenue Trend Over Time")
-trend = (
-    fdf.groupby(fdf["TransactionDate"].dt.date)["PurchaseAmount"]
-    .sum()
-    .reset_index()
-    .rename(columns={"TransactionDate": "Date", "PurchaseAmount": "Revenue"})
-)
-fig_trend = px.line(
-    trend, x="Date", y="Revenue", markers=True,
-    template="plotly_white",
-)
-fig_trend.update_traces(line_color="#2563EB")
-fig_trend.update_layout(margin=dict(t=20, b=20), height=350)
-st.plotly_chart(fig_trend, use_container_width=True)
+row1_col1, row1_col2 = st.columns(2)
 
-st.markdown("---")
-
-# ----------------------------------------------------------------------------
-# SEGMENT VIEWS
-# ----------------------------------------------------------------------------
-st.subheader("👥 Customer Segment Performance")
-col1, col2 = st.columns(2)
-
-with col1:
-    seg_rev = (
-        fdf.groupby("CustomerSegment")["PurchaseAmount"]
+with row1_col1:
+    st.subheader("Revenue Trend Over Time")
+    trend = (
+        fdf.groupby(fdf["TransactionDate"].dt.date)["PurchaseAmount"]
         .sum()
         .reset_index()
-        .rename(columns={"PurchaseAmount": "Revenue"})
-        .sort_values("Revenue", ascending=False)
+        .rename(columns={"TransactionDate": "Date", "PurchaseAmount": "Revenue"})
     )
-    fig_seg_rev = px.bar(
-        seg_rev, x="CustomerSegment", y="Revenue", color="CustomerSegment",
-        template="plotly_white", title="Revenue by Customer Segment",
+    fig_trend = px.line(
+        trend, x="Date", y="Revenue", markers=True, template="plotly_white"
     )
-    fig_seg_rev.update_layout(showlegend=False, margin=dict(t=40, b=20), height=350)
-    st.plotly_chart(fig_seg_rev, use_container_width=True)
+    fig_trend.update_layout(margin=dict(l=10, r=10, t=10, b=10))
+    st.plotly_chart(fig_trend, use_container_width=True)
 
-with col2:
-    seg_dist = fdf["CustomerSegment"].value_counts().reset_index()
-    seg_dist.columns = ["CustomerSegment", "Count"]
-    fig_seg_dist = px.pie(
-        seg_dist, names="CustomerSegment", values="Count", hole=0.45,
-        template="plotly_white", title="Customer Segment Distribution",
+with row1_col2:
+    st.subheader("Revenue by Customer Segment")
+    seg_rev = (
+        fdf.groupby("label")["PurchaseAmount"]
+        .sum()
+        .reset_index()
+        .sort_values("PurchaseAmount", ascending=False)
     )
-    fig_seg_dist.update_layout(margin=dict(t=40, b=20), height=350)
+    fig_seg = px.bar(
+        seg_rev,
+        x="label",
+        y="PurchaseAmount",
+        color="label",
+        template="plotly_white",
+        labels={"label": "Segment", "PurchaseAmount": "Revenue"},
+    )
+    fig_seg.update_layout(margin=dict(l=10, r=10, t=10, b=10), showlegend=False)
+    st.plotly_chart(fig_seg, use_container_width=True)
+
+# ----------------------------------------------------------------------------
+# Row 2: Segment distribution + Revenue by product category
+# ----------------------------------------------------------------------------
+row2_col1, row2_col2 = st.columns(2)
+
+with row2_col1:
+    st.subheader("Customer Segment Distribution")
+    seg_counts = fdf["label"].value_counts().reset_index()
+    seg_counts.columns = ["Segment", "Count"]
+    fig_seg_dist = px.pie(
+        seg_counts, names="Segment", values="Count", hole=0.45, template="plotly_white"
+    )
+    fig_seg_dist.update_layout(margin=dict(l=10, r=10, t=10, b=10))
     st.plotly_chart(fig_seg_dist, use_container_width=True)
 
-st.markdown("---")
-
-# ----------------------------------------------------------------------------
-# CATEGORY / REGION / CHANNEL VIEWS
-# ----------------------------------------------------------------------------
-st.subheader("🛒 Revenue Breakdown")
-col3, col4, col5 = st.columns(3)
-
-with col3:
+with row2_col2:
+    st.subheader("Revenue by Product Category")
     cat_rev = (
         fdf.groupby("ProductCategory")["PurchaseAmount"]
         .sum()
         .reset_index()
-        .rename(columns={"PurchaseAmount": "Revenue"})
-        .sort_values("Revenue", ascending=False)
-        .head(10)  # top 10 categories keeps the chart readable
+        .sort_values("PurchaseAmount", ascending=True)
     )
     fig_cat = px.bar(
-        cat_rev, x="Revenue", y="ProductCategory", orientation="h",
-        template="plotly_white", title="Revenue by Product Category (Top 10)",
-        color="Revenue", color_continuous_scale="Blues",
+        cat_rev,
+        x="PurchaseAmount",
+        y="ProductCategory",
+        orientation="h",
+        template="plotly_white",
+        labels={"PurchaseAmount": "Revenue", "ProductCategory": "Category"},
     )
-    fig_cat.update_layout(
-        yaxis={"categoryorder": "total ascending"},
-        showlegend=False, coloraxis_showscale=False,
-        margin=dict(t=40, b=20), height=380,
-    )
+    fig_cat.update_layout(margin=dict(l=10, r=10, t=10, b=10))
     st.plotly_chart(fig_cat, use_container_width=True)
 
-with col4:
-    reg_rev = (
+# ----------------------------------------------------------------------------
+# Row 3: Revenue by region + Revenue by retail channel
+# ----------------------------------------------------------------------------
+row3_col1, row3_col2 = st.columns(2)
+
+with row3_col1:
+    st.subheader("Revenue by Region")
+    region_rev = (
         fdf.groupby("CustomerRegion")["PurchaseAmount"]
         .sum()
         .reset_index()
-        .rename(columns={"PurchaseAmount": "Revenue"})
-        .sort_values("Revenue", ascending=False)
+        .sort_values("PurchaseAmount", ascending=False)
     )
-    fig_reg = px.bar(
-        reg_rev, x="CustomerRegion", y="Revenue", color="CustomerRegion",
-        template="plotly_white", title="Revenue by Region",
+    fig_region = px.bar(
+        region_rev,
+        x="CustomerRegion",
+        y="PurchaseAmount",
+        color="CustomerRegion",
+        template="plotly_white",
+        labels={"CustomerRegion": "Region", "PurchaseAmount": "Revenue"},
     )
-    fig_reg.update_layout(showlegend=False, margin=dict(t=40, b=20), height=380)
-    st.plotly_chart(fig_reg, use_container_width=True)
+    fig_region.update_layout(margin=dict(l=10, r=10, t=10, b=10), showlegend=False)
+    st.plotly_chart(fig_region, use_container_width=True)
 
-with col5:
-    chan_rev = (
+with row3_col2:
+    st.subheader("Revenue by Retail Channel")
+    channel_rev = (
         fdf.groupby("RetailChannel")["PurchaseAmount"]
         .sum()
         .reset_index()
-        .rename(columns={"PurchaseAmount": "Revenue"})
     )
-    fig_chan = px.pie(
-        chan_rev, names="RetailChannel", values="Revenue", hole=0.45,
-        template="plotly_white", title="Revenue by Retail Channel",
+    fig_channel = px.pie(
+        channel_rev,
+        names="RetailChannel",
+        values="PurchaseAmount",
+        hole=0.45,
+        template="plotly_white",
     )
-    fig_chan.update_layout(margin=dict(t=40, b=20), height=380)
-    st.plotly_chart(fig_chan, use_container_width=True)
-
-st.markdown("---")
+    fig_channel.update_layout(margin=dict(l=10, r=10, t=10, b=10))
+    st.plotly_chart(fig_channel, use_container_width=True)
 
 # ----------------------------------------------------------------------------
-# SATISFACTION VIEWS
+# Row 4: Satisfaction distribution + Purchase amount vs satisfaction
 # ----------------------------------------------------------------------------
-st.subheader("⭐ Customer Satisfaction")
-col6, col7 = st.columns(2)
+row4_col1, row4_col2 = st.columns(2)
 
-with col6:
-    fig_sat_dist = px.histogram(
-        fdf, x="CustomerSatisfaction", nbins=5,
-        template="plotly_white", title="Customer Satisfaction Distribution",
-        color_discrete_sequence=["#2563EB"],
+with row4_col1:
+    st.subheader("Customer Satisfaction Distribution")
+    fig_sat = px.histogram(
+        fdf,
+        x="CustomerSatisfaction",
+        nbins=5,
+        template="plotly_white",
+        labels={"CustomerSatisfaction": "Satisfaction Rating"},
     )
-    fig_sat_dist.update_layout(
-        bargap=0.15, margin=dict(t=40, b=20), height=350,
-        xaxis_title="Satisfaction Score", yaxis_title="Number of Transactions",
-    )
-    st.plotly_chart(fig_sat_dist, use_container_width=True)
+    fig_sat.update_layout(margin=dict(l=10, r=10, t=10, b=10), bargap=0.15)
+    st.plotly_chart(fig_sat, use_container_width=True)
 
-with col7:
+with row4_col2:
+    st.subheader("Purchase Amount vs. Customer Satisfaction")
     fig_scatter = px.scatter(
-        fdf, x="PurchaseAmount", y="CustomerSatisfaction",
-        color="CustomerSegment", template="plotly_white",
-        title="Purchase Amount vs. Customer Satisfaction",
-        opacity=0.75,
+        fdf,
+        x="CustomerSatisfaction",
+        y="PurchaseAmount",
+        color="label",
+        template="plotly_white",
+        labels={
+            "CustomerSatisfaction": "Satisfaction Rating",
+            "PurchaseAmount": "Purchase Amount",
+            "label": "Segment",
+        },
+        hover_data=["CustomerID", "ProductCategory"],
     )
-    fig_scatter.update_layout(margin=dict(t=40, b=20), height=350)
+    fig_scatter.update_layout(margin=dict(l=10, r=10, t=10, b=10))
     st.plotly_chart(fig_scatter, use_container_width=True)
 
 st.markdown("---")
 
 # ----------------------------------------------------------------------------
-# TOP 5 CUSTOMERS TABLE
+# Top 5 Customers table
 # ----------------------------------------------------------------------------
 st.subheader("🏆 Top 5 Customers by Total Revenue")
 top_customers = (
@@ -327,8 +407,8 @@ top_customers = (
         TotalRevenue=("PurchaseAmount", "sum"),
         Transactions=("PurchaseAmount", "count"),
         AvgSatisfaction=("CustomerSatisfaction", "mean"),
-        PrimarySegment=("CustomerSegment", lambda s: s.mode().iat[0] if not s.mode().empty else "Unknown"),
-        PrimaryRegion=("CustomerRegion", lambda s: s.mode().iat[0] if not s.mode().empty else "Unknown"),
+        Segment=("label", lambda s: s.mode().iat[0] if not s.mode().empty else "N/A"),
+        Region=("CustomerRegion", lambda s: s.mode().iat[0] if not s.mode().empty else "N/A"),
     )
     .reset_index()
     .sort_values("TotalRevenue", ascending=False)
@@ -336,125 +416,70 @@ top_customers = (
 )
 top_customers["TotalRevenue"] = top_customers["TotalRevenue"].round(2)
 top_customers["AvgSatisfaction"] = top_customers["AvgSatisfaction"].round(2)
-
-st.dataframe(
-    top_customers.rename(columns={
-        "CustomerID": "Customer ID",
-        "TotalRevenue": "Total Revenue ($)",
-        "Transactions": "# Transactions",
-        "AvgSatisfaction": "Avg. Satisfaction",
-        "PrimarySegment": "Primary Segment",
-        "PrimaryRegion": "Primary Region",
-    }),
-    use_container_width=True,
-    hide_index=True,
-)
+st.dataframe(top_customers, use_container_width=True, hide_index=True)
 
 st.markdown("---")
 
 # ----------------------------------------------------------------------------
-# AUTOMATED BUSINESS INSIGHTS
+# Business Insights (auto-generated from the filtered data)
 # ----------------------------------------------------------------------------
 st.subheader("💡 Business Insights")
-st.caption("Automatically generated from the currently filtered data.")
 
-insights_col1, insights_col2 = st.columns(2)
+# Highest-performing customer segments
+seg_perf = fdf.groupby("label")["PurchaseAmount"].sum().sort_values(ascending=False)
+top_segment = seg_perf.index[0] if len(seg_perf) else "N/A"
+top_segment_share = (seg_perf.iloc[0] / total_revenue * 100) if total_revenue else 0
 
-# --- Highest-performing customer segment -----------------------------------
-best_segment = seg_rev.iloc[0]["CustomerSegment"] if not seg_rev.empty else "N/A"
-best_segment_rev = seg_rev.iloc[0]["Revenue"] if not seg_rev.empty else 0
+# Strongest product categories
+cat_perf = fdf.groupby("ProductCategory")["PurchaseAmount"].sum().sort_values(ascending=False)
+top_category = cat_perf.index[0] if len(cat_perf) else "N/A"
+top_category_share = (cat_perf.iloc[0] / total_revenue * 100) if total_revenue else 0
 
-# --- Strongest product category ---------------------------------------------
-best_category = cat_rev.iloc[0]["ProductCategory"] if not cat_rev.empty else "N/A"
-best_category_rev = cat_rev.iloc[0]["Revenue"] if not cat_rev.empty else 0
+# Regions with growth opportunity (lowest revenue region)
+region_perf = fdf.groupby("CustomerRegion")["PurchaseAmount"].sum().sort_values()
+growth_region = region_perf.index[0] if len(region_perf) else "N/A"
 
-# --- Region with growth opportunity (lowest revenue among active regions) ---
-growth_region_row = reg_rev.sort_values("Revenue", ascending=True).iloc[0] if not reg_rev.empty else None
+# Warning signs — customers in decline or with low satisfaction
+declining_customers = fdf[fdf["label"] == "Decline"]["CustomerID"].nunique()
+low_satisfaction_pct = (fdf["CustomerSatisfaction"] <= 2).mean() * 100
 
-# --- Declining customer warning signs ---------------------------------------
-decline_df = fdf[fdf["CustomerSegment"].str.lower() == "decline"]
-low_satisfaction_df = fdf[fdf["CustomerSatisfaction"] <= 2]
+insight_col1, insight_col2 = st.columns(2)
 
-with insights_col1:
+with insight_col1:
+    st.markdown("**📈 Performance Highlights**")
     st.markdown(
-        f"""<div class="insight-card positive">
-        <b>🏅 Top Segment:</b> The <b>{best_segment}</b> segment leads in revenue,
-        generating <b>${best_segment_rev:,.0f}</b> in the current filtered view.
-        </div>""",
-        unsafe_allow_html=True,
+        f"- **{top_segment}** is the top-performing customer segment, "
+        f"contributing **{top_segment_share:.1f}%** of total revenue.\n"
+        f"- **{top_category}** is the strongest product category, generating "
+        f"**${cat_perf.iloc[0]:,.2f}** (**{top_category_share:.1f}%** of revenue).\n"
+        f"- The **{growth_region}** region currently shows the lowest revenue "
+        f"and represents a growth opportunity for targeted campaigns."
     )
+
+with insight_col2:
+    st.markdown("**⚠️ Warning Signs**")
     st.markdown(
-        f"""<div class="insight-card positive">
-        <b>🛍️ Strongest Category:</b> <b>{best_category}</b> is the top-performing
-        product category, contributing <b>${best_category_rev:,.0f}</b> in revenue.
-        </div>""",
-        unsafe_allow_html=True,
+        f"- **{declining_customers}** customer(s) are currently flagged in the "
+        f"**Decline** segment and are at risk of churn.\n"
+        f"- **{low_satisfaction_pct:.1f}%** of transactions have a satisfaction "
+        f"rating of 2 or below, signaling dissatisfaction risk.\n"
+        f"- Monitor the **{growth_region}** region and the **Decline** segment "
+        f"closely — both indicate softening customer engagement."
     )
-    if growth_region_row is not None:
-        st.markdown(
-            f"""<div class="insight-card">
-            <b>🌍 Growth Opportunity:</b> The <b>{growth_region_row['CustomerRegion']}</b>
-            region currently generates the least revenue
-            (${growth_region_row['Revenue']:,.0f}), representing an opportunity for
-            targeted regional marketing investment.
-            </div>""",
-            unsafe_allow_html=True,
-        )
 
-with insights_col2:
-    if not decline_df.empty:
-        decline_share = len(decline_df) / len(fdf) * 100
-        st.markdown(
-            f"""<div class="insight-card warning">
-            <b>⚠️ Decline Warning:</b> Customers labeled <b>Decline</b> make up
-            <b>{decline_share:.1f}%</b> of filtered transactions, with an average
-            satisfaction of <b>{decline_df['CustomerSatisfaction'].mean():.2f}/5</b>.
-            These accounts are at elevated churn risk.
-            </div>""",
-            unsafe_allow_html=True,
-        )
-    if not low_satisfaction_df.empty:
-        st.markdown(
-            f"""<div class="insight-card warning">
-            <b>⚠️ Low Satisfaction Alert:</b> <b>{len(low_satisfaction_df)}</b>
-            transactions have a satisfaction score of 2 or below, spanning
-            <b>{low_satisfaction_df['CustomerID'].nunique()}</b> unique customers —
-            a signal worth proactive outreach.
-            </div>""",
-            unsafe_allow_html=True,
-        )
-    if decline_df.empty and low_satisfaction_df.empty:
-        st.markdown(
-            """<div class="insight-card positive">
-            <b>✅ Healthy Base:</b> No significant decline or low-satisfaction
-            signals detected in the current filtered view.
-            </div>""",
-            unsafe_allow_html=True,
-        )
-
-# --- Recommendations ---------------------------------------------------------
-st.markdown("#### 🎯 Recommended Actions")
+st.markdown("**🎯 Recommended Actions**")
 st.markdown(
     f"""
-    <div class="insight-card action">
-    <b>1. Double down on {best_segment}:</b> Expand loyalty offers and
-    personalized campaigns for the {best_segment} segment to reinforce the
-    revenue it already drives.
-    </div>
-    <div class="insight-card action">
-    <b>2. Launch a win-back campaign for at-risk customers:</b> Target
-    customers in the Decline segment and those with satisfaction scores of
-    2 or below with tailored retention offers, discounts, or proactive
-    customer service outreach.
-    </div>
-    <div class="insight-card action">
-    <b>3. Invest in regional and category expansion:</b> Increase marketing
-    spend in {growth_region_row['CustomerRegion'] if growth_region_row is not None else 'underperforming regions'}
-    and promote {best_category} alongside complementary categories to grow
-    basket size across all channels.
-    </div>
-    """,
-    unsafe_allow_html=True,
+1. **Protect at-risk revenue** — launch a targeted retention offer (loyalty
+   discount, personalized outreach) for the **Decline** segment before their
+   next expected purchase window.
+2. **Double down on what's working** — increase marketing spend behind
+   **{top_category}**, NovaRetail's strongest category, and cross-sell it to
+   customers in the **{top_segment}** segment who haven't purchased it yet.
+3. **Invest in the {growth_region} region** — run localized promotions or
+   channel expansion (e.g., more online availability) to close the revenue
+   gap with top-performing regions.
+"""
 )
 
 st.markdown("---")
